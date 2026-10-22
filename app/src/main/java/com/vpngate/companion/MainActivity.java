@@ -128,6 +128,24 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
             if (pos >= 0 && pos < shown.size()) shareConfig(shown.get(pos));
             return true;
         });
+
+        showLastCrashIfAny();
+    }
+
+    /** اگر اجرای قبلی کرش کرده، گزارشش را نشان بده و در کلیپ‌بورد بگذار تا قابل ارسال باشد */
+    private void showLastCrashIfAny() {
+        try {
+            final String report = CrashCapture.collectRecent(this);
+            if (report == null) return;
+            logView.append(report + "\n");
+            statusView.setText("گزارش کرش اجرای قبل، در لاگ پایین کپی شد — لطفاً برای من ارسال کنید");
+            Object cm = getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm instanceof android.content.ClipboardManager) {
+                ((android.content.ClipboardManager) cm).setPrimaryClip(
+                        android.content.ClipData.newPlainText("vpg-crash", report));
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     // ---------- اتصال ----------

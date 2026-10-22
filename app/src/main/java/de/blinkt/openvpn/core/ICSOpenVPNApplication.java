@@ -41,6 +41,8 @@ public class ICSOpenVPNApplication extends Application {
         LocaleHelper.setDesiredLocale(this);
         super.onCreate();
 
+        com.vpngate.companion.CrashCapture.install(getApplicationContext());
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             createNotificationChannels();
         mStatus = new StatusListener();
