@@ -48,12 +48,15 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
     private static final int REQ_IMPORT = 41;
     private static final int REQ_VPN = 47;
     private static final int REQ_NOTIF = 48;
-    private static final int PROBE_THREADS = 12;
-    private static final int AUTO_CANDIDATES = 40;
+    private static final int PROBE_THREADS = 16;
+    private static final int PROBE_POOL_CAP = 250;  // حداکثر سرور برای تست TCP (قبلاً 40 بود)
+    private static final int AUTO_QUEUE = 30;       // حداکثر کاندید در صف failover
     private static final int PROBE_TIMEOUT_MS = 2500;
 
     private static final Pattern REMOTE_RE =
             Pattern.compile("(?im)^\\s*remote\\s+([^\\s]+)\\s+(\\d+)");
+    private static final Pattern PROTO_RE =
+            Pattern.compile("(?im)^\\s*proto\\s+(tcp|udp)");
 
     private static final String[] DEFAULT_SOURCES = {
             "https://www.vpngate.net/api/iphone/",
@@ -73,6 +76,8 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
     private ServerAdapter adapter;
     private String countryFilter = "";
     private boolean fetching = false;
+    private volatile boolean probing = false;
+    private volatile boolean probeCancel = false;
     private Runnable pendingAfterVpnGrant;
 
     private static class Server {
@@ -104,6 +109,8 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
                     setAutoBtn(false);
                     statusView.setText(R.string.vpg_stopped);
                 }));
+            } else if (probing) {
+                probeCancel = true; // لغوی تست‌ها؛ دکمه بعداً به حالت عادی برمی‌گردد
             } else {
                 startAuto();
             }
@@ -124,9 +131,15 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
         autoBtn.setText(running ? R.string.vpg_disconnect : R.string.vpg_auto_connect);
     }
 
-    private List<VpnKeeper.Candidate> probeServers(List<Server> servers, int limit) throws InterruptedException {
+    /**
+     * v2.1: کل استخر (تا ۲۵۰ سرور، با احترام به فیلتر کشور) تست می‌شود — نه فقط ۴۰ سرورِ برتر.
+     * فقط کانفیگ‌های TCP به‌طور معناداری قابل تست‌اند؛ کانفیگ‌های UDP «تست‌نشده» ولی آخر صف
+     * می‌روند (در ایران OpenVPN/UDP تقریباً همیشه مسدود است). تست با IP به‌جای hostname انجام
+     * می‌شود تا DNS-hang رخ ندهد و در هر لحظه قابل لغو است.
+     */
+    private List<VpnKeeper.Candidate> probeServers(List<Server> servers) {
         List<Server> pool = new ArrayList<>(servers);
-        if (pool.size() > limit) pool = pool.subList(0, limit);
+        if (pool.size() > PROBE_POOL_CAP) pool = pool.subList(0, PROBE_POOL_CAP);
 
         List<Probe> results = Collections.synchronizedList(new ArrayList<>());
         ExecutorService ex = Executors.newFixedThreadPool(PROBE_THREADS);
@@ -135,60 +148,98 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
 
         for (Server s : pool) {
             ex.execute(() -> {
-                Remote r = parseRemote(s);
+                Remote r = probeCancel ? null : parseRemote(s);
                 long lat = -1;
-                if (r != null) lat = tcpProbe(r.host, r.port, PROBE_TIMEOUT_MS);
-                results.add(new Probe(s, r == null ? "?" : r.host + ":" + r.port, lat));
+                if (r != null && r.isTcp) lat = tcpProbe(r.host, r.port, PROBE_TIMEOUT_MS);
+                results.add(new Probe(s, r == null ? "?" : r.host + ":" + r.port, lat,
+                        r != null && r.isTcp));
                 int d = done.incrementAndGet();
                 runOnUiThread(() -> statusView.setText(getString(R.string.vpg_probing, d, total)));
             });
         }
         ex.shutdown();
-        ex.awaitTermination(90, java.util.concurrent.TimeUnit.SECONDS);
+        try {
+            while (!ex.awaitTermination(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                if (probeCancel) {
+                    ex.shutdownNow();
+                    break;
+                }
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            ex.shutdownNow();
+        }
 
-        List<Probe> alive = new ArrayList<>();
-        for (Probe p : results) if (p.latency >= 0) alive.add(p);
-        Collections.sort(alive, (a, b) -> Long.compare(a.latency, b.latency));
+        List<Probe> tcpAlive = new ArrayList<>();
+        List<Probe> udpOnly = new ArrayList<>();
+        for (Probe p : results) {
+            if (p.isTcp && p.latency >= 0) tcpAlive.add(p);
+            else if (!p.isTcp) udpOnly.add(p);
+        }
+        Collections.sort(tcpAlive, (a, b) -> Long.compare(a.latency, b.latency));
 
         List<VpnKeeper.Candidate> out = new ArrayList<>();
-        for (Probe p : alive) {
-            try {
-                String cfg = new String(Base64.decode(p.s.b64, Base64.DEFAULT), "UTF-8");
-                VpnKeeper.Candidate c = new VpnKeeper.Candidate();
-                c.label = p.s.countryShort + " · " + p.s.host + " (" + p.latency + "ms)";
-                c.config = cfg;
-                out.add(c);
-            } catch (Exception ignored) {
-            }
+        for (Probe p : tcpAlive) {
+            VpnKeeper.Candidate c = buildCandidate(p.s, p.latency, true);
+            if (c != null) out.add(c);
+            if (out.size() >= AUTO_QUEUE) return out;
+        }
+        for (Probe p : udpOnly) { // آخر صف: تأییدنشده
+            VpnKeeper.Candidate c = buildCandidate(p.s, -1, false);
+            if (c != null) out.add(c);
+            if (out.size() >= AUTO_QUEUE) return out;
         }
         return out;
+    }
+
+    private VpnKeeper.Candidate buildCandidate(Server s, long latency, boolean verified) {
+        try {
+            String cfg = new String(Base64.decode(s.b64, Base64.DEFAULT), "UTF-8");
+            VpnKeeper.Candidate c = new VpnKeeper.Candidate();
+            c.label = s.countryShort + " · " + s.host
+                    + (latency >= 0 ? " (" + latency + "ms)" : "");
+            c.config = cfg;
+            c.verified = verified;
+            c.latency = latency;
+            return c;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static class Probe {
         final Server s;
         final String ep;
         final long latency;
+        final boolean isTcp;
 
-        Probe(Server s, String ep, long latency) {
+        Probe(Server s, String ep, long latency, boolean isTcp) {
             this.s = s;
             this.ep = ep;
             this.latency = latency;
+            this.isTcp = isTcp;
         }
     }
 
     private static class Remote {
         String host;
         int port;
+        boolean isTcp;
     }
 
     private static Remote parseRemote(Server s) {
         try {
             String cfg = new String(Base64.decode(s.b64, Base64.DEFAULT), "UTF-8");
+            boolean isTcp = false;
+            Matcher pm = PROTO_RE.matcher(cfg);
+            if (pm.find()) isTcp = "tcp".equalsIgnoreCase(pm.group(1));
             Matcher m = REMOTE_RE.matcher(cfg);
             if (m.find()) {
                 Remote r = new Remote();
-                r.host = m.group(1);
+                // تست با IP از CSV — بدون DNS تا هرگز گیر نکند
+                r.host = (s.ip != null && !s.ip.trim().isEmpty()) ? s.ip.trim() : m.group(1);
                 r.port = Integer.parseInt(m.group(2));
+                r.isTcp = isTcp;
                 return r;
             }
         } catch (Exception ignored) {
@@ -226,58 +277,62 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
     }
 
     private void startAuto() {
+        if (probing || VpnKeeper.isActive()) return;
         if (all.isEmpty()) {
             fetchList();
             return;
         }
         requestNotificationPermissionIfNeeded();
-        statusView.setText(R.string.vpg_probing_start);
+        // اول اجازهٔ VPN — تا دیالوگ وسط تست ظاهر نشود
+        ensureVpnPermissionAnd(() -> runOnUiThread(this::runAutoProbe));
+    }
+
+    private void runAutoProbe() {
+        setAutoBtn(true); // حالا دکمه نقش توقف/لغو دارد
         progress.setVisibility(View.VISIBLE);
+        probing = true;
+        probeCancel = false;
+        statusView.setText(R.string.vpg_probing_start);
+        final List<Server> pool = countryFilter.isEmpty() ? all : new ArrayList<>(shown);
         new Thread(() -> {
-            try {
-                List<VpnKeeper.Candidate> cands = probeServers(all, AUTO_CANDIDATES);
-                runOnUiThread(() -> progress.setVisibility(View.GONE));
-                if (cands.isEmpty()) {
-                    runOnUiThread(() -> statusView.setText(R.string.vpg_no_alive));
-                    return;
-                }
-                ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
-                    setAutoBtn(true);
-                    VpnKeeper.begin(this, cands, this);
-                }));
-            } catch (Exception e) {
+            List<VpnKeeper.Candidate> cands = probeServers(pool);
+            probing = false;
+            runOnUiThread(() -> progress.setVisibility(View.GONE));
+            if (probeCancel) {
                 runOnUiThread(() -> {
-                    progress.setVisibility(View.GONE);
-                    statusView.setText("خطا: " + e.getMessage());
+                    setAutoBtn(false);
+                    statusView.setText(R.string.vpg_stopped);
                 });
+                return;
             }
+            if (cands.isEmpty()) {
+                runOnUiThread(() -> {
+                    setAutoBtn(false);
+                    statusView.setText(R.string.vpg_no_alive);
+                });
+                return;
+            }
+            runOnUiThread(() -> VpnKeeper.begin(MainActivity.this, cands, MainActivity.this));
         }, "prober").start();
     }
 
     private void connectSingle(Server s) {
-        if (VpnKeeper.isActive()) return;
+        if (probing || VpnKeeper.isActive()) return;
         requestNotificationPermissionIfNeeded();
         statusView.setText(getString(R.string.vpg_testing_one, s.countryShort + " · " + s.host));
         progress.setVisibility(View.VISIBLE);
         new Thread(() -> {
-            try {
-                List<VpnKeeper.Candidate> cands = probeServers(
-                        new ArrayList<>(Collections.singletonList(s)), 1);
-                runOnUiThread(() -> progress.setVisibility(View.GONE));
-                if (cands.isEmpty()) {
-                    runOnUiThread(() -> statusView.setText(R.string.vpg_server_dead));
-                    return;
-                }
-                ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
-                    setAutoBtn(true);
-                    VpnKeeper.begin(this, cands, this);
-                }));
-            } catch (Exception e) {
-                runOnUiThread(() -> {
-                    progress.setVisibility(View.GONE);
-                    statusView.setText("خطا: " + e.getMessage());
-                });
-            }
+            Remote r = parseRemote(s);
+            long lat = -1;
+            if (r != null && r.isTcp) lat = tcpProbe(r.host, r.port, PROBE_TIMEOUT_MS);
+            final long fLat = lat;
+            // کاندید همیشه ساخته می‌شود — حتی اگر تست TCP رد شد (موتور خودش گزارش می‌دهد)
+            final VpnKeeper.Candidate c = buildCandidate(s, fLat, r != null && r.isTcp && fLat >= 0);
+            runOnUiThread(() -> progress.setVisibility(View.GONE));
+            runOnUiThread(() -> ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
+                setAutoBtn(true);
+                VpnKeeper.begin(this, Collections.singletonList(c), this);
+            })));
         }, "prober1").start();
     }
 
@@ -346,10 +401,10 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
                     VpnKeeper.Candidate c = new VpnKeeper.Candidate();
                     c.label = label;
                     c.config = cfg;
-                    ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
+                    runOnUiThread(() -> ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
                         setAutoBtn(true);
                         VpnKeeper.begin(this, Collections.singletonList(c), this);
-                    }));
+                    })));
                 }, "import-connect").start();
             } catch (Exception e) {
                 statusView.setText("خطا: " + e.getMessage());
