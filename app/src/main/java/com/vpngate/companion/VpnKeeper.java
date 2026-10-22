@@ -112,6 +112,9 @@ public final class VpnKeeper implements VpnStatus.StateListener, VpnStatus.LogLi
     private int idx = -1;
     private boolean stopping = false;
     private boolean connectedOnce = false;
+    private boolean hadConnectedOnce = false; // برای این کاندید: آیا روزی وصل شد؟
+    private int sameRetry = 0;                // چند بار به همان سرور تلاش مجدد شده
+    private static final int MAX_SAME_RETRY = 2;
     private boolean failingOver = false;
     private boolean sawEngineState = false;
     private long attemptStart = 0L;
@@ -137,6 +140,8 @@ public final class VpnKeeper implements VpnStatus.StateListener, VpnStatus.LogLi
         failingOver = false;
         sawEngineState = false;
         connectedOnce = false;
+        hadConnectedOnce = false;
+        sameRetry = 0;
         if (idx >= cands.size()) {
             teardown();
             ui.onIdle("all_failed");
@@ -144,11 +149,26 @@ public final class VpnKeeper implements VpnStatus.StateListener, VpnStatus.LogLi
         }
         final int gen = ++generation;
         attemptStart = System.currentTimeMillis();
-        Candidate c = cands.get(idx);
-        currentLabel = c.label;
+        currentLabel = cands.get(idx).label;
         ui.onPhase(String.format(java.util.Locale.US, "%d/%d%s",
-                idx + 1, cands.size(), c.verified ? "" : " (تست نشده)"));
+                idx + 1, cands.size(), cands.get(idx).verified ? "" : " (تست نشده)"));
+        startAttempt(cands.get(idx), gen);
+    }
 
+    /** قطع‌شدن یک سروری که قبلاً وصل بود: اول ۲ بار به همان سرور، بعد سرور بعدی */
+    private void reconnectSame() {
+        if (stopping) return;
+        sameRetry++;
+        failingOver = false;
+        sawEngineState = false;
+        connectedOnce = false;
+        final int gen = ++generation;
+        attemptStart = System.currentTimeMillis();
+        ui.onPhase("تلاش مجدد " + currentLabel);
+        startAttempt(cands.get(idx), gen);
+    }
+
+    private void startAttempt(Candidate c, final int gen) {
         try {
             ConfigParser cp = new ConfigParser();
             cp.parseConfig(new StringReader(c.config));
@@ -209,6 +229,8 @@ public final class VpnKeeper implements VpnStatus.StateListener, VpnStatus.LogLi
 
             if (level == ConnectionStatus.LEVEL_CONNECTED) {
                 connectedOnce = true;
+                hadConnectedOnce = true;
+                sameRetry = 0; // اتصال موفق: شمارندهٔ تلاش مجدد صفر شود
                 generation++; // cancel watchdog / grace timers
                 ui.onConnected(currentLabel);
             } else if (level == ConnectionStatus.LEVEL_AUTH_FAILED
@@ -219,6 +241,12 @@ public final class VpnKeeper implements VpnStatus.StateListener, VpnStatus.LogLi
                 // a DISCONNECTED arriving instantly after we started a new attempt
                 // is the farewell of the previous server — ignore it
                 if (!sawEngineState && elapsed < START_GRACE) return;
+                // سرور خوبی داشتیم و پروسه کشته/قطع شد؟ اول به همان سرور تلاش کن
+                if (hadConnectedOnce && sameRetry < MAX_SAME_RETRY) {
+                    engineLog("-- قطع شد؛ تلاش دوباره به همان سرور (" + (sameRetry + 1) + "/" + MAX_SAME_RETRY + ")");
+                    reconnectSame();
+                    return;
+                }
                 engineLog("-- " + state);
                 failover();
             } else if ("RECONNECTING".equals(state)) {

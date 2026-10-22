@@ -2,11 +2,15 @@ package com.vpngate.companion;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.Base64;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -76,6 +80,7 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
     private ServerAdapter adapter;
     private String countryFilter = "";
     private boolean fetching = false;
+    private boolean batteryAsked = false;
     private volatile boolean probing = false;
     private volatile boolean probeCancel = false;
     private Runnable pendingAfterVpnGrant;
@@ -352,6 +357,22 @@ public class MainActivity extends Activity implements VpnKeeper.Ui {
     @Override
     public void onConnected(String server) {
         statusView.setText(getString(R.string.vpg_connected, server));
+        // جلوگیری از کشتن سرویس VPN توسط سیستم/OEM («killed for memory pressure»)
+        maybeAskBatteryExemption();
+    }
+
+    /** یک بار در هر اجرا، بعد از اولین اتصال موفق، معافیت بهینه‌سازی باتری را می‌خواهد */
+    private void maybeAskBatteryExemption() {
+        if (batteryAsked) return;
+        batteryAsked = true;
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Throwable ignored) {
+            // برخی دستگاه‌ها این صفحه را ندارند؛ تنظیم دستی لازم است
+        }
     }
 
     @Override
