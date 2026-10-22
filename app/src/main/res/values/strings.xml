@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">دستیار VPN Gate</string>
+    <string name="fetch_btn">دریافت لیست سرورها</string>
+    <string name="import_btn">بازکردن فایل .ovpn</string>
+    <string name="url_hint">آدرس منبع CSV (خالی = پیش‌فرض خودکار)</string>
+    <string name="status_ready">آماده. روی «دریافت لیست سرورها» بزنید تا سرورهای فعال VPN Gate گرفته شود، بعد روی هر سرور بزنید تا در OpenVPN باز شود.</string>
+    <string name="fetching">در حال دریافت لیست سرورها…</string>
+    <string name="fetch_fail">دریافت لیست ناموفق بود. اینترنت/فیلترشکن را چک کنید، یا یک آدرس منبع جایگزین در کادر بالا وارد کنید.</string>
+    <string name="parse_fail">لیست گرفته شد ولی قابل خواندن نبود — یک منبع دیگر را امتحان کنید.</string>
+    <string name="fetched_n">%1$d سرور دریافت شد — روی هر کدام بزنید تا در OpenVPN باز شود.</string>
+    <string name="empty_list">موردی در این فیلتر پیدا نشد.</string>
+    <string name="all_countries">همه کشورها</string>
+    <string name="openvpn_missing">اپ OpenVPN پیدا نشد! ابتدا «OpenVPN for Android» (de.blinkt.openvpn) را نصب کنید.</string>
+    <string name="open_with">بازکردن کانفیگ با…</string>
+    <string name="imported_ok">فایل وارد شد — حالا در OpenVPN باز می‌شود…</string>
+</resources>
