@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:colorPrimary">@color/primary</item>
-        <item name="android:colorPrimaryDark">@color/primaryDark</item>
-        <item name="android:colorAccent">@color/accent</item>
-        <item name="android:statusBarColor">@color/primaryDark</item>
+        <item name="android:colorPrimary">@color/vpg_primary</item>
+        <item name="android:colorPrimaryDark">@color/vpg_primaryDark</item>
+        <item name="android:colorAccent">@color/vpg_accent</item>
+        <item name="android:statusBarColor">@color/vpg_primaryDark</item>
         <item name="android:windowBackground">#F5F7FB</item>
     </style>
+
+    <!-- ics-openvpn engine styles (used by engine activities/services) -->
+    <style name="blinkt.baseTheme" parent="android:Theme.DeviceDefault.Light" />
+    <style name="blinkt.dialog" parent="android:Theme.DeviceDefault.Light.Dialog" />
+    <style name="Theme.CreateShortCut" parent="android:Theme.DeviceDefault.DialogWhenLarge" />
+    <style name="blinkt" parent="blinkt.baseTheme" />
 </resources>

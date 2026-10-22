@@ -15,7 +15,7 @@
         android:layout_height="wrap_content"
         android:textSize="16sp"
         android:textStyle="bold"
-        android:textColor="@color/textMain" />
+        android:textColor="@color/vpg_textMain" />
 
     <TextView
         android:id="@+id/line2"
@@ -23,6 +23,6 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="2dp"
         android:textSize="13sp"
-        android:textColor="@color/textSub" />
+        android:textColor="@color/vpg_textSub" />
 
 </LinearLayout>

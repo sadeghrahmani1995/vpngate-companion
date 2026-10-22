@@ -28,11 +28,11 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Build APK (release, signed with stable key)
+        run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk VpngateCompanion.apk
+        run: cp app/build/outputs/apk/release/app-release.apk VpngateCompanion.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -44,8 +44,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
-          name: "دستیار VPN Gate — بیلد ${{ github.run_number }}"
+          name: "دستیار VPN Gate 2.0 — بیلد ${{ github.run_number }}"
           files: VpngateCompanion.apk
-          body: "APK خروجی بیلد خودکار. برای نصب، اجازهٔ «نصب از منابع ناشناس» را بدهید. پیش‌نیاز: اپ OpenVPN for Android."
+          body: |
+            نسخهٔ ۲.۰ — اپ کاملاً مستقل:
+            - موتور OpenVPN داخلی (بدون نیاز به OpenVPN for Android)
+            - دریافت خودکار لیست سرورهای VPN Gate (۴ منبع، با ریدایرکت)
+            - تست TCP پورت سرورها و انتخاب سریع‌ترین
+            - اتصال خودکار + failover (در صورت قطعی، سرور بعدی)
+            - امضای ثابت: از این به بعد آپدیت‌ها بدون حذف برنامه نصب می‌شوند
+
+            نکتهٔ نصب: اگر نسخهٔ قبلی را نصب دارید، اول آن را Uninstall کنید (فقط یک بار).
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,8 +1,10 @@
 package com.vpngate.companion;
 
-import android.app.Activity;
+import android.Manifest;
 import android.content.Intent;
-import android.net.Uri;
+import android.content.pm.PackageManager;
+import android.net.VpnService;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
 import android.view.LayoutInflater;
@@ -10,28 +12,47 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.EditText;
 import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 
-import androidx.core.content.FileProvider;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-public class MainActivity extends Activity {
+import de.blinkt.openvpn.R;
+
+public class MainActivity extends Activity implements VpnKeeper.Ui {
 
     private static final int REQ_IMPORT = 41;
+    private static final int REQ_VPN = 47;
+    private static final int REQ_NOTIF = 48;
+    private static final int PROBE_THREADS = 12;
+    private static final int AUTO_CANDIDATES = 40;
+    private static final int PROBE_TIMEOUT_MS = 2500;
+
+    private static final Pattern REMOTE_RE =
+            Pattern.compile("(?im)^\\s*remote\\s+([^\\s]+)\\s+(\\d+)");
 
     private static final String[] DEFAULT_SOURCES = {
             "https://www.vpngate.net/api/iphone/",
@@ -40,16 +61,18 @@ public class MainActivity extends Activity {
             "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@main/data/vpngate.csv"
     };
 
-    private TextView statusView;
+    private TextView statusView, logView;
     private ProgressBar progress;
     private Spinner countrySpin;
     private ListView listView;
+    private TextView autoBtn;
 
     private final List<Server> all = new ArrayList<>();
     private final List<Server> shown = new ArrayList<>();
     private ServerAdapter adapter;
     private String countryFilter = "";
     private boolean fetching = false;
+    private Runnable pendingAfterVpnGrant;
 
     private static class Server {
         String host, ip, countryLong, countryShort, b64;
@@ -63,26 +86,296 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         statusView = findViewById(R.id.statusView);
+        logView = findViewById(R.id.logView);
         progress = findViewById(R.id.progress);
         countrySpin = findViewById(R.id.countrySpin);
         listView = findViewById(R.id.listView);
+        autoBtn = findViewById(R.id.autoBtn);
 
         adapter = new ServerAdapter();
         listView.setAdapter(adapter);
 
         findViewById(R.id.fetchBtn).setOnClickListener(v -> fetchList());
         findViewById(R.id.importBtn).setOnClickListener(v -> pickFile());
+        autoBtn.setOnClickListener(v -> {
+            if (VpnKeeper.isActive()) {
+                VpnKeeper.requestStop(() -> runOnUiThread(() -> {
+                    setAutoBtn(false);
+                    statusView.setText(R.string.vpg_stopped);
+                }));
+            } else {
+                startAuto();
+            }
+        });
 
         listView.setOnItemClickListener((parent, view, pos, id) -> {
-            if (pos >= 0 && pos < shown.size()) openInOpenVpn(shown.get(pos));
+            if (pos >= 0 && pos < shown.size()) connectSingle(shown.get(pos));
         });
+        listView.setOnItemLongClickListener((parent, view, pos, id) -> {
+            if (pos >= 0 && pos < shown.size()) shareConfig(shown.get(pos));
+            return true;
+        });
+    }
+
+    // ---------- اتصال ----------
+
+    private void setAutoBtn(boolean running) {
+        autoBtn.setText(running ? R.string.vpg_disconnect : R.string.vpg_auto_connect);
+    }
+
+    private List<VpnKeeper.Candidate> probeServers(List<Server> servers, int limit) throws InterruptedException {
+        List<Server> pool = new ArrayList<>(servers);
+        if (pool.size() > limit) pool = pool.subList(0, limit);
+
+        List<Probe> results = Collections.synchronizedList(new ArrayList<>());
+        ExecutorService ex = Executors.newFixedThreadPool(PROBE_THREADS);
+        AtomicInteger done = new AtomicInteger();
+        int total = pool.size();
+
+        for (Server s : pool) {
+            ex.execute(() -> {
+                Remote r = parseRemote(s);
+                long lat = -1;
+                if (r != null) lat = tcpProbe(r.host, r.port, PROBE_TIMEOUT_MS);
+                results.add(new Probe(s, r == null ? "?" : r.host + ":" + r.port, lat));
+                int d = done.incrementAndGet();
+                runOnUiThread(() -> statusView.setText(getString(R.string.vpg_probing, d, total)));
+            });
+        }
+        ex.shutdown();
+        ex.awaitTermination(90, java.util.concurrent.TimeUnit.SECONDS);
+
+        List<Probe> alive = new ArrayList<>();
+        for (Probe p : results) if (p.latency >= 0) alive.add(p);
+        Collections.sort(alive, (a, b) -> Long.compare(a.latency, b.latency));
+
+        List<VpnKeeper.Candidate> out = new ArrayList<>();
+        for (Probe p : alive) {
+            try {
+                String cfg = new String(Base64.decode(p.s.b64, Base64.DEFAULT), "UTF-8");
+                VpnKeeper.Candidate c = new VpnKeeper.Candidate();
+                c.label = p.s.countryShort + " · " + p.s.host + " (" + p.latency + "ms)";
+                c.config = cfg;
+                out.add(c);
+            } catch (Exception ignored) {
+            }
+        }
+        return out;
+    }
+
+    private static class Probe {
+        final Server s;
+        final String ep;
+        final long latency;
+
+        Probe(Server s, String ep, long latency) {
+            this.s = s;
+            this.ep = ep;
+            this.latency = latency;
+        }
+    }
+
+    private static class Remote {
+        String host;
+        int port;
+    }
+
+    private static Remote parseRemote(Server s) {
+        try {
+            String cfg = new String(Base64.decode(s.b64, Base64.DEFAULT), "UTF-8");
+            Matcher m = REMOTE_RE.matcher(cfg);
+            if (m.find()) {
+                Remote r = new Remote();
+                r.host = m.group(1);
+                r.port = Integer.parseInt(m.group(2));
+                return r;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static long tcpProbe(String host, int port, int timeoutMs) {
+        long t0 = System.currentTimeMillis();
+        try (Socket sock = new Socket()) {
+            sock.connect(new InetSocketAddress(host, port), timeoutMs);
+            return System.currentTimeMillis() - t0;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private void ensureVpnPermissionAnd(Runnable action) {
+        Intent prep = VpnService.prepare(this);
+        if (prep != null) {
+            pendingAfterVpnGrant = action;
+            startActivityForResult(prep, REQ_VPN);
+            return;
+        }
+        action.run();
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
+        }
+    }
+
+    private void startAuto() {
+        if (all.isEmpty()) {
+            fetchList();
+            return;
+        }
+        requestNotificationPermissionIfNeeded();
+        statusView.setText(R.string.vpg_probing_start);
+        progress.setVisibility(View.VISIBLE);
+        new Thread(() -> {
+            try {
+                List<VpnKeeper.Candidate> cands = probeServers(all, AUTO_CANDIDATES);
+                runOnUiThread(() -> progress.setVisibility(View.GONE));
+                if (cands.isEmpty()) {
+                    runOnUiThread(() -> statusView.setText(R.string.vpg_no_alive));
+                    return;
+                }
+                ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
+                    setAutoBtn(true);
+                    VpnKeeper.begin(this, cands, this);
+                }));
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    progress.setVisibility(View.GONE);
+                    statusView.setText("خطا: " + e.getMessage());
+                });
+            }
+        }, "prober").start();
+    }
+
+    private void connectSingle(Server s) {
+        if (VpnKeeper.isActive()) return;
+        requestNotificationPermissionIfNeeded();
+        statusView.setText(getString(R.string.vpg_testing_one, s.countryShort + " · " + s.host));
+        progress.setVisibility(View.VISIBLE);
+        new Thread(() -> {
+            try {
+                List<VpnKeeper.Candidate> cands = probeServers(
+                        new ArrayList<>(Collections.singletonList(s)), 1);
+                runOnUiThread(() -> progress.setVisibility(View.GONE));
+                if (cands.isEmpty()) {
+                    runOnUiThread(() -> statusView.setText(R.string.vpg_server_dead));
+                    return;
+                }
+                ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
+                    setAutoBtn(true);
+                    VpnKeeper.begin(this, cands, this);
+                }));
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    progress.setVisibility(View.GONE);
+                    statusView.setText("خطا: " + e.getMessage());
+                });
+            }
+        }, "prober1").start();
+    }
+
+    // ---------- VpnKeeper.Ui ----------
+
+    @Override
+    public void onPhase(String msg) {
+        statusView.setText(getString(R.string.vpg_connecting_phase, msg));
+    }
+
+    @Override
+    public void onEngineLog(String line) {
+        logView.append(line + "\n");
+        if (logView.getLineCount() > 200) logView.setText("");
+    }
+
+    @Override
+    public void onConnected(String server) {
+        statusView.setText(getString(R.string.vpg_connected, server));
+    }
+
+    @Override
+    public void onIdle(String code) {
+        setAutoBtn(false);
+        if ("all_failed".equals(code)) {
+            statusView.setText(R.string.vpg_all_failed);
+        } else {
+            statusView.setText(R.string.vpg_stopped);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_VPN) {
+            Runnable r = pendingAfterVpnGrant;
+            pendingAfterVpnGrant = null;
+            if (resultCode == RESULT_OK && r != null) r.run();
+            else statusView.setText(R.string.vpg_vpn_denied);
+        } else if (requestCode == REQ_IMPORT && resultCode == RESULT_OK
+                && data != null && data.getData() != null) {
+            try {
+                InputStream in = getContentResolver().openInputStream(data.getData());
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                in.close();
+                final String cfg = bo.toString("UTF-8");
+                final String label = "فایل واردشده";
+                statusView.setText(getString(R.string.vpg_testing_one, label));
+                progress.setVisibility(View.VISIBLE);
+                new Thread(() -> {
+                    long lat = -1;
+                    Matcher m = REMOTE_RE.matcher(cfg);
+                    if (m.find()) lat = tcpProbe(m.group(1), Integer.parseInt(m.group(2)), PROBE_TIMEOUT_MS);
+                    final long fLat = lat;
+                    runOnUiThread(() -> progress.setVisibility(View.GONE));
+                    VpnKeeper.Candidate c = new VpnKeeper.Candidate();
+                    c.label = label;
+                    c.config = cfg;
+                    ensureVpnPermissionAnd(() -> runOnUiThread(() -> {
+                        setAutoBtn(true);
+                        VpnKeeper.begin(this, Collections.singletonList(c), this);
+                    }));
+                }, "import-connect").start();
+            } catch (Exception e) {
+                statusView.setText("خطا: " + e.getMessage());
+            }
+        }
+    }
+
+    // ---------- اشتراک‌گذاری کانفیگ (fallback) ----------
+
+    private void shareConfig(Server s) {
+        try {
+            byte[] data = Base64.decode(s.b64, Base64.DEFAULT);
+            String safe = (s.host == null || s.host.isEmpty()) ? "server" : s.host.replaceAll("[^A-Za-z0-9._-]", "_");
+            File f = new File(getCacheDir(), "vg_" + safe + ".ovpn");
+            FileOutputStream fo = new FileOutputStream(f);
+            fo.write(data);
+            fo.close();
+            androidx.core.content.FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f);
+            Intent sh = new Intent(Intent.ACTION_SEND);
+            sh.setType("application/octet-stream");
+            sh.putExtra(Intent.EXTRA_STREAM,
+                    androidx.core.content.FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f));
+            sh.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(sh, getString(R.string.vpg_share)));
+        } catch (Exception e) {
+            statusView.setText("خطا: " + e.getMessage());
+        }
     }
 
     // ---------- دریافت لیست ----------
 
     private void fetchList() {
         if (fetching) return;
-        String custom = ((android.widget.EditText) findViewById(R.id.urlEdit)).getText().toString().trim();
+        String custom = ((EditText) findViewById(R.id.urlEdit)).getText().toString().trim();
         List<String> urls = new ArrayList<>();
         if (!custom.isEmpty()) {
             urls.add(custom);
@@ -121,7 +414,7 @@ public class MainActivity extends Activity {
                 }
                 buildCountrySpinner();
                 applyFilter();
-                statusView.setText(getString(R.string.fetched_n, all.size()));
+                statusView.setText(getString(R.string.vpg_fetched_n, all.size()));
             });
         }, "fetcher").start();
     }
@@ -134,7 +427,7 @@ public class MainActivity extends Activity {
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(12000);
             c.setReadTimeout(25000);
-            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) vpngate-companion/1.0");
+            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) vpngate-companion/2.0");
             int code = c.getResponseCode();
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
                 String loc = c.getHeaderField("Location");
@@ -190,7 +483,7 @@ public class MainActivity extends Activity {
         Collections.sort(codes);
 
         List<String> items = new ArrayList<>();
-        items.add(getString(R.string.all_countries) + " (" + all.size() + ")");
+        items.add(getString(R.string.vpg_all_countries) + " (" + all.size() + ")");
         for (String c : codes) {
             int n = 0;
             for (Server s : all) if (s.countryShort.equals(c)) n++;
@@ -219,87 +512,7 @@ public class MainActivity extends Activity {
             if (countryFilter.isEmpty() || s.countryShort.equals(countryFilter)) shown.add(s);
         }
         adapter.notifyDataSetChanged();
-        if (shown.isEmpty()) statusView.setText(R.string.empty_list);
-    }
-
-    // ---------- بازکردن کانفیگ در OpenVPN ----------
-
-    private void openInOpenVpn(Server s) {
-        try {
-            byte[] data = Base64.decode(s.b64, Base64.DEFAULT);
-            String safe = (s.host == null || s.host.isEmpty()) ? "server" : s.host.replaceAll("[^A-Za-z0-9._-]", "_");
-            File f = new File(getCacheDir(), "vg_" + safe + ".ovpn");
-            FileOutputStream fo = new FileOutputStream(f);
-            fo.write(data);
-            fo.close();
-            launchOvpn(f);
-        } catch (Exception e) {
-            statusView.setText("خطا: " + e.getMessage());
-        }
-    }
-
-    private void launchOvpn(File f) {
-        Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f);
-
-        // 1) OpenVPN for Android (de.blinkt.openvpn)
-        Intent i1 = new Intent(Intent.ACTION_VIEW);
-        i1.setDataAndType(uri, "application/x-openvpn");
-        i1.setPackage("de.blinkt.openvpn");
-        i1.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        if (canOpen(i1)) {
-            startActivity(i1);
-            return;
-        }
-
-        // 2) OpenVPN Connect (net.openvpn.openvpn)
-        Intent i2 = new Intent("net.openvpn.openvpn.OPENVPN_PROFILE");
-        i2.putExtra(Intent.EXTRA_STREAM, uri);
-        i2.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        if (canOpen(i2)) {
-            startActivity(i2);
-            return;
-        }
-
-        // 3) هیچ اپ OpenVPN نیست -> اشتراک‌گذاری عمومی + پیام راهنما
-        statusView.setText(R.string.openvpn_missing);
-        Intent sh = new Intent(Intent.ACTION_SEND);
-        sh.setType("application/octet-stream");
-        sh.putExtra(Intent.EXTRA_STREAM, uri);
-        sh.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        startActivity(Intent.createChooser(sh, getString(R.string.open_with)));
-    }
-
-    private boolean canOpen(Intent i) {
-        return getPackageManager().resolveActivity(i, 0) != null;
-    }
-
-    // ---------- واردکردن فایل از حافظه ----------
-
-    private void pickFile() {
-        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        i.addCategory(Intent.CATEGORY_OPENABLE);
-        i.setType("*/*");
-        startActivityForResult(i, REQ_IMPORT);
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_IMPORT || resultCode != RESULT_OK || data == null || data.getData() == null) return;
-        try {
-            InputStream in = getContentResolver().openInputStream(data.getData());
-            File f = new File(getCacheDir(), "imported_" + System.currentTimeMillis() + ".ovpn");
-            FileOutputStream fo = new FileOutputStream(f);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) fo.write(buf, 0, n);
-            fo.close();
-            in.close();
-            statusView.setText(R.string.imported_ok);
-            launchOvpn(f);
-        } catch (Exception e) {
-            statusView.setText("خطا: " + e.getMessage());
-        }
+        if (shown.isEmpty()) statusView.setText(R.string.vpg_empty_list);
     }
 
     // ---------- آداپتر لیست ----------

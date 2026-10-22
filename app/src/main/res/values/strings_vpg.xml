@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">دستیار VPN Gate</string>
+    <string name="fetch_btn">دریافت لیست سرورها</string>
+    <string name="import_btn">اتصال با فایل .ovpn</string>
+    <string name="url_hint">آدرس منبع CSV (خالی = پیش‌فرض خودکار)</string>
+    <string name="fetching">در حال دریافت لیست سرورها…</string>
+    <string name="fetch_fail">دریافت لیست ناموفق بود. اینترنت/فیلترشکن را چک کنید، یا یک آدرس منبع جایگزین در کادر بالا وارد کنید.</string>
+    <string name="parse_fail">لیست گرفته شد ولی قابل خواندن نبود — یک منبع دیگر را امتحان کنید.</string>
+
+    <string name="vpg_status_ready">آماده. ابتدا «دریافت لیست سرورها» را بزنید؛ سپس «اتصال خودکار» بهترین سرور را پیدا کرده و مستقیماً وصل می‌شود.</string>
+    <string name="vpg_fetched_n">%1$d سرور دریافت شد. روی «اتصال خودکار» بزنید یا روی سرور دلخواه ضربه بزنید.</string>
+    <string name="vpg_all_countries">همه کشورها</string>
+    <string name="vpg_empty_list">موردی در این فیلتر پیدا نشد.</string>
+    <string name="vpg_auto_connect">اتصال خودکار (تست + وصل شدن)</string>
+    <string name="vpg_disconnect">قطع اتصال</string>
+    <string name="vpg_probing">تست سرورها… %1$d/%2$d</string>
+    <string name="vpg_probing_start">در حال تست TCP سرورها برای انتخاب بهترین…</string>
+    <string name="vpg_no_alive">هیچ سروری روی پورت‌هایش جواب نداد. لیست را دوباره بگیرید یا بعداً تلاش کنید.</string>
+    <string name="vpg_testing_one">در حال تست و اتصال به %1$s…</string>
+    <string name="vpg_server_dead">این سرور جواب نداد (پورت بسته یا فیلتر). سرور دیگری را امتحان کنید.</string>
+    <string name="vpg_connecting_phase">اتصال و آزمون خودکار (%1$s) — در صورت قطعی، سرور بعدی…</string>
+    <string name="vpg_connected">متصل شد ✓ %1$s</string>
+    <string name="vpg_all_failed">هیچ‌کدام از سرورها وصل نشدند. دوباره تلاش کنید یا کشور دیگری انتخاب کنید.</string>
+    <string name="vpg_stopped">اتصال قطع شد.</string>
+    <string name="vpg_vpn_denied">اجازهٔ VPN داده نشد؛ اتصال ممکن نیست.</string>
+    <string name="vpg_share">اشتراک‌گذاری کانفیگ…</string>
+    <string name="vpg_engine_log">لاگ موتور VPN</string>
+</resources>
