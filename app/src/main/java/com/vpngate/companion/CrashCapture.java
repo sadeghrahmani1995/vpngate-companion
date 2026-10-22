@@ -1,5 +1,6 @@
 package com.vpngate.companion;
 
+import android.app.Application;
 import android.content.Context;
 import android.os.Build;
 import android.util.Log;
