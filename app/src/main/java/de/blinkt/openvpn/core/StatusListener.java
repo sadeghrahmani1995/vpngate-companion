@@ -111,7 +111,7 @@ public class StatusListener implements VpnStatus.LogListener, VpnStatus.ProfileN
                     VpnStatus.initLogCache(mCacheDir);
                     /* Set up logging to Logcat with a context) */
 
-                    if (BuildConfig.DEBUG || BuildConfig.FLAVOR.equals("skeleton")) {
+                    if (BuildConfig.DEBUG || false) {
                         VpnStatus.addLogListener(StatusListener.this);
                     }
                 }
